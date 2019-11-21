@@ -2,6 +2,8 @@
 
 # python std lib
 from __future__ import with_statement
+import threading
+import time
 
 # rediscluster imports
 from rediscluster.exceptions import (
@@ -15,6 +17,7 @@ from rediscluster.utils import (
     first_key,
     clusterdown_wrapper,
     parse_cluster_slots,
+    BlockingDict
 )
 
 # 3rd party imports
@@ -149,3 +152,52 @@ def test_clusterdown_wrapper():
     with pytest.raises(ClusterDownError) as cex:
         bad_func()
     assert unicode(cex.value).startswith("CLUSTERDOWN error. Unable to rebuild the cluster")
+
+
+def test_blocking_dict_blocks_per_item():
+    store = BlockingDict(3, 2)
+    store.put('joe', 4)
+    store.put('joe', 'dog')
+    items_fetched = []
+
+    def target(items_fetched):
+        time.sleep(0.1)
+        items_fetched.append(store.get('joe'))
+
+    threading.Thread(target=target, args=(items_fetched,)).start()
+    start = time.time()
+    store.put('joe', 'dog')
+    assert time.time() - start >= 0.1
+    assert items_fetched == ['dog']
+
+
+def test_blocking_dict_blocks_for_total():
+    store = BlockingDict(3, 2)
+    store.put('joe', 4)
+    store.put('joe', 'dog')
+    store.put('bob', 5)
+    items_fetched = []
+
+    def target(items_fetched):
+        time.sleep(0.1)
+        items_fetched.append(store.get('bob'))
+
+    threading.Thread(target=target, args=(items_fetched,)).start()
+    start = time.time()
+    store.put('bob', 'cat')
+    assert time.time() - start >= 0.1
+    assert items_fetched == [5]
+
+
+def test_blocking_dict_blocks_for_empty():
+    store = BlockingDict(3, 2)
+
+    def target():
+        time.sleep(0.1)
+        store.put('joe', 4)
+
+    threading.Thread(target=target).start()
+    start = time.time()
+    result = store.get('joe')
+    assert time.time() - start >= 0.1
+    assert result == 4

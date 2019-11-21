@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from socket import gethostbyaddr
 from functools import wraps
+import threading
+from collections import defaultdict
 
 # rediscluster imports
 from .exceptions import (
@@ -255,3 +257,75 @@ def parse_pubsub_numsub(command, res, **options):
     for channel, numsub in numsub_d.items():
         ret_numsub.append((channel, numsub))
     return ret_numsub
+
+
+class BlockingDict():
+    def __init__(self, max_total_items, max_items_per_key):
+        """Performs all configuration."""
+        self.max_total_items = max_total_items
+        self.max_items_per_key = max_items_per_key
+        self.clear()
+
+    def clear(self):
+        """Resets state entirely. Be careful if there are still threads waiting."""
+        self.num_items = 0
+        self._store = defaultdict(list)
+
+        # Note that the three Condition Variables use the same lock,
+        # so that we can selectively wake at the key and the total level.
+        self._lock = threading.Lock()
+        self.total_capacity_cv = threading.Condition(self._lock)
+
+        # Keep track of keys that are full
+        self.full_cv_by_key = defaultdict(lambda: threading.Condition(self._lock))
+
+        # Keep track of keys that are empty
+        self.empty_cv_by_key = defaultdict(lambda: threading.Condition(self._lock))
+
+    def num_items_for_key(self, key):
+        """Returns number of items in key."""
+        with self._lock:
+            return self._num_items_for_key
+
+    def _num_items_for_key(self, key):
+        """Returns number of items in key. Should be used with mutual exclusion."""
+        return len(self._store[key])
+
+    def get(self, key, timeout=None):
+        with self._lock:
+            while self._num_items_for_key(key) == 0:
+                wait_complete = self.empty_cv_by_key[key].wait(timeout)
+                if not wait_complete:
+                    pass  # can raise here for timeout
+            try:
+                ret_value = self._store[key].pop()
+            except IndexError:
+                # failed to remove an element with the given key,
+                # so no waiting threads are affected.
+                ret_value = None
+
+            if ret_value is not None:
+                self.num_items -= 1
+                self.full_cv_by_key[key].notify()
+                self.total_capacity_cv.notify_all()
+
+        return ret_value
+
+    def put(self, key, val, timeout=None):
+        with self._lock:
+            while self.num_items >= self.max_total_items or self._num_items_for_key(key) >= self.max_items_per_key:
+                per_item_wait_complete = True
+                total_wait_complete = True
+                if self._num_items_for_key(key) >= self.max_items_per_key:
+                    # if the key is full, we wait for a ``get`` to occur on that key.
+                    per_item_wait_complete = self.full_cv_by_key[key].wait(timeout)
+                if self.num_items >= self.max_total_items:
+                    # if the total num items has reach capacity we wake on any ``get``.
+                    total_wait_complete = self.total_capacity_cv.wait(timeout)
+
+                if not per_item_wait_complete or not total_wait_complete:
+                    pass  # can raise here for timeout
+
+            self._store[key].append(val)
+            self.num_items += 1
+            self.empty_cv_by_key[key].notify()
