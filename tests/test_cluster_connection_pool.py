@@ -198,27 +198,16 @@ class TestClusterBlockingConnectionPool(object):
 
     def test_connection_creation(self):
         connection_kwargs = {'foo': 'bar', 'biz': 'baz'}
-        pool = self.get_pool(connection_kwargs=connection_kwargs)
+        pool = self.get_pool(connection_kwargs=connection_kwargs, max_connections_per_node=True)
         connection = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
         assert isinstance(connection, DummyConnection)
         assert connection.kwargs == connection_kwargs
 
     def test_multiple_connections(self):
-        pool = self.get_pool()
+        pool = self.get_pool(max_connections_per_node=True)
         c1 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
         c2 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
         assert c1 != c2
-
-    def test_connection_pool_blocks_until_timeout(self):
-        "When out of connections, block for timeout seconds, then raise"
-        pool = self.get_pool(max_connections=1, timeout=0.1)
-        pool.get_connection("pubsub")
-
-        start = time.time()
-        with pytest.raises(redis.ConnectionError):
-            pool.get_connection("pubsub")
-        # we should have waited at least 0.1 seconds
-        assert time.time() - start >= 0.1
 
     def test_max_per_node_connection_pool_blocks_until_timeout(self):
         "When out of connections, block for timeout seconds, then raise"
@@ -238,23 +227,6 @@ class TestClusterBlockingConnectionPool(object):
         with pytest.raises(redis.ConnectionError):
             pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
         # we should have waited at least 0.1 seconds
-        assert time.time() - start >= 0.1
-
-    def test_connection_pool_blocks_until_another_connection_released(self):
-        """
-        When out of connections, block until another connection is released
-        to the pool
-        """
-        pool = self.get_pool(max_connections=1, timeout=2)
-        c1 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
-
-        def target():
-            time.sleep(0.1)
-            pool.release(c1)
-
-        Thread(target=target).start()
-        start = time.time()
-        pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
         assert time.time() - start >= 0.1
 
     def test_max_per_node_connection_pool_blocks_until_another_connection_released(self):
@@ -285,29 +257,24 @@ class TestClusterBlockingConnectionPool(object):
         assert time.time() - start >= 0.1
 
     def test_reuse_previously_released_connection(self):
-        # Test that behaviour for re-use is the same whatever metric we block on.
-        def reuse_previously_released_connections_test(enable_max_connections_per_node):
-            pool = self.get_pool(max_connections_per_node=enable_max_connections_per_node)
-            c1 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
-            pool.release(c1)
+        pool = self.get_pool(max_connections_per_node=True)
+        c1 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
+        pool.release(c1)
 
-            # release c2 back in and make sure c3 still picks the connection with the correct node
-            c2 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
-            pool.release(c2)
+        # release c2 back in and make sure c3 still picks the connection with the correct node
+        c2 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
+        pool.release(c2)
 
-            c3 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
-            c4 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
-            c5 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
+        c3 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
+        c4 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7001})
+        c5 = pool.get_connection_by_node({"host": "127.0.0.1", "port": 7000})
 
-            # ensure reuse
-            assert c1 == c3
-            assert c2 == c4
+        # ensure reuse
+        assert c1 == c3
+        assert c2 == c4
 
-            # check that re-use policy is not naive
-            assert c5 != c1  # also expresses that c5 does not equal c3
-
-        reuse_previously_released_connections_test(enable_max_connections_per_node=True)
-        reuse_previously_released_connections_test(enable_max_connections_per_node=False)
+        # check that re-use policy is not naive
+        assert c5 != c1  # also expresses that c5 does not equal c3
 
     def test_repr_contains_db_info_tcp(self):
         """
@@ -317,7 +284,8 @@ class TestClusterBlockingConnectionPool(object):
         connection_kwargs = {'host': 'localhost', 'port': 7000}
         pool = self.get_pool(connection_kwargs=connection_kwargs,
                              connection_class=ClusterConnection,
-                             init_slot_cache=False)
+                             init_slot_cache=False,
+                             max_connections_per_node=True)
         expected = 'ClusterBlockingConnectionPool<ClusterConnection<host=localhost,port=7000>>'
         assert repr(pool) == expected
 
@@ -329,7 +297,8 @@ class TestClusterBlockingConnectionPool(object):
         connection_kwargs = {'path': '/abc', 'db': 1}
         pool = self.get_pool(connection_kwargs=connection_kwargs,
                              connection_class=UnixDomainSocketConnection,
-                             init_slot_cache=False)
+                             init_slot_cache=False,
+                             max_connections_per_node=True)
         expected = 'ClusterBlockingConnectionPool<ClusterUnixDomainSocketConnection<path=/abc>>'
         assert repr(pool) == expected
 

@@ -382,6 +382,9 @@ class ClusterBlockingConnectionPool(ClusterConnectionPool):
                  skip_full_coverage_check=False, nodemanager_follow_cluster=False,
                  timeout=20, queue_class=LifoQueue, **connection_kwargs):
 
+        if not max_connections_per_node:
+            raise NotImplementedError
+
         self.queue_class = queue_class
         self.timeout = timeout
 
@@ -408,23 +411,10 @@ class ClusterBlockingConnectionPool(ClusterConnectionPool):
                 break
         return pool
 
-    def get_pool(self, node):
-        return self._pool_by_node[node["name"]] \
-            if self.max_connections_per_node or node is None else self._group_pool
-
     def reset(self):
         self.pid = os.getpid()
         self._check_lock = threading.Lock()
-
-        """
-        We could use a conditional branch on ``max_connections_per_node`` to see which pool to initialize,
-        but ClusterConnectionPool calls ConnectionPool init which has no concept of ``max_connections_per_node``,
-        and also performs ``reset()``. This will lead to an attribute error.
-
-        This could suggest removing inheritance from ConnectionPool, but initializing both should not add much overhead.
-        """
         self._pool_by_node = defaultdict(self.blocking_pool_factory)
-        self._group_pool = self.blocking_pool_factory()
 
         # Keep a list of actual connection instances so that we can
         # disconnect them later.
@@ -459,39 +449,14 @@ class ClusterBlockingConnectionPool(ClusterConnectionPool):
         self._checkpid()
         self.nodes.set_node_name(node)
         connection = None
-        connections_to_other_nodes = []
-        pool = self.get_pool(node=node)
         try:
-            connection = pool.get(block=True, timeout=self.timeout)
-            while connection is not None and connection.node != node:
-                connections_to_other_nodes.append(connection)
-                connection = pool.get(block=True, timeout=self.timeout)
-
+            connection = self._pool_by_node[node["name"]].get(block=True, timeout=self.timeout)
         except Empty:
-            # queue is full of connections to other nodes
-            if len(connections_to_other_nodes) == self.max_connections:
-                # is the earliest released / longest un-used connection
-                connection_to_clear = connections_to_other_nodes.pop()
-                self._connections.remove(connection_to_clear)
-                connection_to_clear.disconnect()
-                connection = None  # get a new connection
-            else:
-                # Note that this is not caught by the redis cluster client and will be
-                # raised unless handled by application code.
+            # Note that this is not caught by the redis cluster client and will be
+            # raised unless handled by application code.
 
-                # ``ConnectionError`` is raised when timeout is hit on the queue.
-                raise ConnectionError("No connection available")
-
-        # Put all the connections belonging to other nodes back,
-        # disconnecting the ones we fail to return.
-        for idx, other_connection in enumerate(connections_to_other_nodes):
-            try:
-                pool.put_nowait(other_connection)
-            except Full:
-                for lost_connection in connections_to_other_nodes[idx:]:
-                    self._connections.remove(lost_connection)
-                    lost_connection.disconnect()
-                break
+            # ``ConnectionError`` is raised when timeout is hit on the queue.
+            raise ConnectionError("No connection available")
 
         if connection is None:
             connection = self.make_connection(node)
@@ -508,7 +473,7 @@ class ClusterBlockingConnectionPool(ClusterConnectionPool):
 
         # Put the connection back into the pool.
         try:
-            self.get_pool(connection.node).put_nowait(connection)
+            self._pool_by_node[connection.node["name"]].put_nowait(connection)
         except Full:
             # perhaps the pool has been reset() after a fork? regardless,
             # we don't want this connection
